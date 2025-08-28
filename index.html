@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Advanced Real-Time Map</title>
+  <meta charset="utf-8" />
+  <style>
+    html, body { height: 100%; margin: 0; padding: 0; }
+    #map { height: 100%; }
+    .controls {
+      position: absolute; top: 10px; left: 10px; z-index: 5;
+      background: #fff; padding: 10px; border-radius: 8px;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.3); font-family: Arial, sans-serif;
+      max-width: 260px;
+    }
+    .controls input, .controls select, .controls button, .controls label {
+      display: block; width: 100%; margin: 6px 0; padding: 8px; box-sizing: border-box;
+    }
+    .row { display: flex; gap: 8px; }
+    .row > * { flex: 1; }
+    .section-title { margin-top: 10px; font-weight: bold; }
+    .note { font-size: 12px; color: #555; }
+  </style>
+</head>
+<body>
+  <div class="controls">
+    <!-- Search -->
+    <input id="search-box" type="text" placeholder="Search a place" />
+
+    <!-- Manual route -->
+    <input id="route-start" type="text" placeholder="Start location" />
+    <input id="route-end" type="text" placeholder="Destination" />
+    <div class="row">
+      <button onclick="drawRoute()">Get Route</button>
+      <button onclick="clearRoute()">Clear Route</button>
+    </div>
+
+    <!-- Combined: Travel mode + Nearby type -->
+    <div class="section-title">Travel Mode & Nearby</div>
+    <select id="travel-mode">
+      <option value="DRIVING">Driving</option>
+      <option value="WALKING">Walking</option>
+      <option value="BICYCLING">Bicycling</option>
+      <option value="TRANSIT">Transit</option>
+    </select>
+    <select id="place-type">
+      <option value="restaurant">Restaurant</option>
+      <option value="atm">ATM</option>
+      <option value="gas_station">Gas Station</option>
+      <option value="hospital">Hospital</option>
+      <option value="hotel">Hotel</option>
+      <option value="cafe">Cafe</option>
+      <option value="pharmacy">Pharmacy</option>
+      <option value="shopping_mall">Shopping Mall</option>
+      <option value="school">School</option>
+    </select>
+    <button onclick="showNearbyPlaces()">Show Nearby</button>
+
+    <!-- Other controls (keep positions) -->
+    <button onclick="centerMapOnUserLocation(true)">Center on My Location</button>
+    <button onclick="startTrackingLocation()">Start Live Tracking</button>
+    <button onclick="stopTrackingLocation()">Stop Live Tracking</button>
+
+    <!-- Layers -->
+    <label class="section-title" style="padding:0;">Layers</label>
+    <label><input type="checkbox" onchange="toggleLayer(trafficLayer, this.checked)"> Traffic</label>
+    <label><input type="checkbox" onchange="toggleLayer(transitLayer, this.checked)"> Transit</label>
+    <label><input type="checkbox" onchange="toggleLayer(bikeLayer, this.checked)"> Bicycling</label>
+
+    <div class="note">Tip: restrict your API key to your domain & these APIs: Maps JS, Places, Directions.</div>
+  </div>
+
+  <div id="map"></div>
+
+  <script>
+    // Globals
+    let map, userMarker, userLocation = { lat: 20.5937, lng: 78.9629 }; // India center (fallback)
+    let watchId = null;
+    let trafficLayer, transitLayer, bikeLayer;
+    let directionsService, directionsRenderer;
+    let nearbyMarkers = [];
+    let sharedInfoWindow; // reuse a single infowindow
+
+    function initMap() {
+      map = new google.maps.Map(document.getElementById("map"), {
+        center: userLocation, zoom: 5, mapTypeId: "roadmap"
+      });
+
+      // Layers
+      trafficLayer = new google.maps.TrafficLayer();
+      transitLayer = new google.maps.TransitLayer();
+      bikeLayer = new google.maps.BicyclingLayer();
+
+      // Directions
+      directionsService = new google.maps.DirectionsService();
+      directionsRenderer = new google.maps.DirectionsRenderer({ map });
+
+      // Shared infowindow
+      sharedInfoWindow = new google.maps.InfoWindow();
+
+      // Features
+      centerMapOnUserLocation(true);
+      initSearchBox();
+
+      // Expose functions used in InfoWindow HTML
+      window.drawRouteFromUserTo = drawRouteFromUserTo;
+    }
+
+    // Geolocation helpers
+    function centerMapOnUserLocation(addMarker = false) {
+      if (!navigator.geolocation) { alert("Geolocation not supported."); return; }
+      navigator.geolocation.getCurrentPosition(
+        pos => {
+          userLocation = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+          map.setCenter(userLocation); map.setZoom(15);
+          if (addMarker) {
+            if (!userMarker) {
+              userMarker = new google.maps.Marker({
+                map, position: userLocation, title: "Your Location",
+                icon: { path: google.maps.SymbolPath.CIRCLE, scale: 8,
+                        fillColor: "#4285F4", fillOpacity: 1, strokeWeight: 2, strokeColor: "#ffffff" }
+              });
+            } else { userMarker.setPosition(userLocation); }
+          }
+        },
+        err => alert("Geolocation error: " + err.message)
+      );
+    }
+
+    function startTrackingLocation() {
+      if (!navigator.geolocation) { alert("Geolocation not supported."); return; }
+      watchId = navigator.geolocation.watchPosition(
+        pos => {
+          userLocation = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+          map.setCenter(userLocation);
+          if (!userMarker) {
+            userMarker = new google.maps.Marker({
+              map, position: userLocation, title: "Live Location",
+              icon: { path: google.maps.SymbolPath.CIRCLE, scale: 8,
+                      fillColor: "#34A853", fillOpacity: 1, strokeWeight: 2, strokeColor: "#ffffff" }
+            });
+          } else { userMarker.setPosition(userLocation); }
+        },
+        err => alert("Error tracking location: " + err.message),
+        { enableHighAccuracy: true }
+      );
+    }
+
+    function stopTrackingLocation() {
+      if (watchId) {
+        navigator.geolocation.clearWatch(watchId); watchId = null;
+        alert("Stopped tracking.");
+      }
+    }
+
+    // Search box (Places Autocomplete)
+    function initSearchBox() {
+      const input = document.getElementById("search-box");
+      const autocomplete = new google.maps.places.Autocomplete(input);
+      autocomplete.bindTo("bounds", map);
+
+      const marker = new google.maps.Marker({ map });
+      autocomplete.addListener("place_changed", () => {
+        const place = autocomplete.getPlace();
+        if (!place.geometry || !place.geometry.location) { alert("No geometry for that place."); return; }
+        map.setCenter(place.geometry.location); map.setZoom(15);
+        marker.setPosition(place.geometry.location);
+      });
+    }
+
+    // Nearby places (radius fixed at 1000m)
+    function showNearbyPlaces() {
+      clearNearbyMarkers();
+      const type = document.getElementById("place-type").value;
+      const service = new google.maps.places.PlacesService(map);
+
+      service.nearbySearch(
+        { location: userLocation, radius: 1000, type: [type] },
+        (results, status) => {
+          if (status !== google.maps.places.PlacesServiceStatus.OK || !results) {
+            alert("Places request failed: " + status);
+            return;
+          }
+          results.forEach(place => {
+            const marker = new google.maps.Marker({
+              map, position: place.geometry.location, title: place.name
+            });
+            nearbyMarkers.push(marker);
+
+            const lat = place.geometry.location.lat();
+            const lng = place.geometry.location.lng();
+            const rating = place.rating ? `Rating: ${place.rating} ⭐` : "Rating: N/A";
+            const vicinity = place.vicinity ? `<div>${place.vicinity}</div>` : "";
+
+            marker.addListener("click", () => {
+              sharedInfoWindow.setContent(`
+                <div style="font-size:14px;line-height:1.3">
+                  <strong>${place.name}</strong>
+                  ${vicinity}
+                  <div>${rating}</div>
+                  <div style="margin-top:6px;">
+                    <button onclick="drawRouteFromUserTo(${lat}, ${lng})">Get Route</button>
+                  </div>
+                </div>
+              `);
+              sharedInfoWindow.open(map, marker);
+            });
+          });
+        }
+      );
+    }
+
+    function clearNearbyMarkers() {
+      nearbyMarkers.forEach(m => m.setMap(null));
+      nearbyMarkers = [];
+    }
+
+    // Routing
+    function getSelectedTravelMode() {
+      return google.maps.TravelMode[document.getElementById("travel-mode").value];
+    }
+
+    function drawRouteFromUserTo(lat, lng) {
+      clearRoute();
+      directionsService.route(
+        {
+          origin: userLocation,
+          destination: { lat, lng },
+          travelMode: getSelectedTravelMode()
+        },
+        (res, status) => {
+          if (status === "OK") { directionsRenderer.setDirections(res); }
+          else { alert("Could not get directions: " + status); }
+        }
+      );
+    }
+
+    function drawRoute() {
+      const start = document.getElementById("route-start").value.trim();
+      const end = document.getElementById("route-end").value.trim();
+      if (!start || !end) { alert("Please enter both start and destination."); return; }
+      clearRoute();
+      directionsService.route(
+        {
+          origin: start, destination: end,
+          travelMode: getSelectedTravelMode()
+        },
+        (res, status) => {
+          if (status === "OK") { directionsRenderer.setDirections(res); }
+          else { alert("Could not get directions: " + status); }
+        }
+      );
+    }
+
+    function clearRoute() {
+      directionsRenderer.setDirections({ routes: [] });
+    }
+
+    // Layer toggles
+    function toggleLayer(layer, show) {
+      layer.setMap(show ? map : null);
+    }
+  </script>
+
+  <!-- Load Google Maps API (replace YOUR_API_KEY with your restricted key) -->
+  <script async defer
+    src="https://maps.googleapis.com/maps/api/js?key=AIzaSyB0iPHgZc4V1KjQIcKenjlD0cZ1rl7K7Hg&callback=initMap&libraries=places">
+  </script>
+</body>
+</html>
